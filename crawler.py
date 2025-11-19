@@ -30,6 +30,10 @@ class DHTNode:
     def start(self):
         if lt is None:
             raise RuntimeError("libtorrent not installed. Please pip install libtorrent.")
+        # Generate random DHT node_id for better network distribution
+        # Spread nodes across DHT keyspace for maximum coverage
+        node_id = os.urandom(20)  # 160-bit random ID
+        
         # libtorrent 2.x uses dict-based settings
         settings = {
             'listen_interfaces': f'0.0.0.0:{self.port}',
@@ -37,6 +41,8 @@ class DHTNode:
             'enable_lsd': False,
             'enable_upnp': False,
             'enable_natpmp': False,
+            'dht_bootstrap_nodes': '',  # We'll add routers manually
+            'peer_fingerprint': node_id[:20],  # Use as peer_id prefix for uniqueness
             'alert_mask': lt.alert.category_t.dht_notification |
                          lt.alert.category_t.status_notification |
                          lt.alert.category_t.error_notification,
