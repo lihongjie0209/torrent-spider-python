@@ -167,15 +167,18 @@ class Downloader:
                     await asyncio.sleep(1)
                     alerts = self.session.pop_alerts()
                     for a in alerts:
-                        if isinstance(a, lt.torrent_error_alert):
-                            if a.handle == handle:
-                                raise RuntimeError(str(a.message()))
+                        # Check for error alerts by category instead of type
+                        if a.category() & lt.alert.category_t.error_notification:
+                            if hasattr(a, 'handle') and a.handle == handle:
+                                raise RuntimeError(a.message())
                     s = handle.status()
                     if s.has_metadata:
-                        ti = handle.get_torrent_info()
+                        ti = handle.torrent_file()
                         files: List[Dict[str, Any]] = []
-                        for f in ti.files():
-                            files.append({"path": f.path, "size": f.size})
+                        # In libtorrent 2.x, iterate files by index
+                        fs = ti.files()
+                        for i in range(fs.num_files()):
+                            files.append({"path": fs.file_path(i), "size": fs.file_size(i)})
                         total_size = ti.total_size()
                         await self.results.write({
                             "infohash": infohash,
@@ -212,12 +215,14 @@ async def node_alert_collector(nodes: List[DHTNode], info_queue: InfoHashQueue, 
     while True:
         for n in nodes:
             for alert in n.pop_alerts():
-                # dht_announce_alert has info_hash attribute
-                if lt and isinstance(alert, lt.dht_announce_alert):
-                    ih_bytes = alert.info_hash.to_bytes()
-                    ih_hex = ih_bytes.hex()
-                    stats.record_announce(n.index)
-                    await info_queue.add(ih_hex)
+                # Check for DHT announce alerts
+                if lt and alert.category() & lt.alert.category_t.dht_notification:
+                    # Extract info_hash from dht_announce_alert
+                    if hasattr(alert, 'info_hash'):
+                        ih_bytes = bytes(alert.info_hash)
+                        ih_hex = ih_bytes.hex()
+                        stats.record_announce(n.index)
+                        await info_queue.add(ih_hex)
         await asyncio.sleep(batch_interval)
 
 
