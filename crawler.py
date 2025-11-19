@@ -62,19 +62,21 @@ class DHTNode:
             return []
         return self.session.pop_alerts()
     
-    def request_dht_sample(self):
-        """Request DHT sample_infohashes (BEP 51) if supported."""
-        if not self.started:
+    def request_dht_sample(self, endpoint):
+        """Send a sample_infohashes request to a remote DHT endpoint if supported.
+
+        endpoint: tuple[str, int] (ip, port)
+        """
+        if not self.started or lt is None:
+            return
+        if not hasattr(self.session, 'dht_sample_infohashes'):
             return
         try:
-            # session.dht_sample_infohashes(endpoint, target) - BEP 51
-            if hasattr(self.session, 'dht_sample_infohashes'):
-                # Use localhost endpoint and random 20-byte target
-                ep = ('127.0.0.1', self.port)
-                target = lt.sha1_hash(os.urandom(20))
-                self.session.dht_sample_infohashes(ep, target)
+            # random 20-byte target for key-space traversal hint (value itself not used by sampler response content)
+            target = lt.sha1_hash(os.urandom(20))
+            self.session.dht_sample_infohashes(endpoint, target)
         except Exception:
-            pass  # Silently ignore if not supported or endpoint format wrong
+            pass  # Ignore failures (unsupported endpoint/IP version etc.)
 
 
 class StatsCollector:
@@ -230,59 +232,151 @@ class Downloader:
                     del self._active[infohash]
 
 
-async def node_alert_collector(nodes: List[DHTNode], info_queue: InfoHashQueue, stats: StatsCollector, batch_interval: float = 0.2):
-    """Poll alerts from all nodes and push discovered infohashes."""
+@dataclass
+class RemoteNodeEntry:
+    endpoint: tuple
+    last_seen: float = field(default_factory=lambda: time.time())
+    next_request: float = field(default_factory=lambda: time.time())
+
+
+class RemoteNodeRegistry:
+    """Maintains a registry of remote DHT nodes discovered via alerts for BEP 51 sampling."""
+    def __init__(self, prune_interval: int = 1800, min_request_interval: int = 10):
+        self._nodes: Dict[tuple, RemoteNodeEntry] = {}
+        self._lock = asyncio.Lock()
+        self._prune_interval = prune_interval
+        self._min_request_interval = min_request_interval
+        self._last_prune = time.time()
+
+    async def add_or_update(self, endpoint: tuple):
+        async with self._lock:
+            entry = self._nodes.get(endpoint)
+            now = time.time()
+            if entry is None:
+                self._nodes[endpoint] = RemoteNodeEntry(endpoint=endpoint, last_seen=now, next_request=now)
+            else:
+                entry.last_seen = now
+
+    async def schedule_from_sample_alert(self, endpoint: tuple, interval_seconds: int):
+        async with self._lock:
+            entry = self._nodes.get(endpoint)
+            if entry:
+                # Respect node-provided interval but enforce a minimum to avoid spamming
+                wait = max(interval_seconds, self._min_request_interval)
+                entry.next_request = time.time() + wait
+
+    async def get_due_endpoints(self, limit: int = 50) -> List[tuple]:
+        async with self._lock:
+            now = time.time()
+            due = [e for e, v in self._nodes.items() if v.next_request <= now]
+            # simple fairness: earliest next_request first
+            due.sort(key=lambda ep: self._nodes[ep].next_request)
+            return due[:limit]
+
+    async def mark_requested(self, endpoint: tuple):
+        async with self._lock:
+            entry = self._nodes.get(endpoint)
+            if entry:
+                # provisional push forward – will be refined by sample response alert
+                entry.next_request = time.time() + self._min_request_interval
+
+    async def prune(self):
+        async with self._lock:
+            now = time.time()
+            if now - self._last_prune < 300:
+                return
+            self._last_prune = now
+            to_delete = [ep for ep, v in self._nodes.items() if now - v.last_seen > self._prune_interval]
+            for ep in to_delete:
+                del self._nodes[ep]
+
+
+async def node_alert_collector(nodes: List[DHTNode], info_queue: InfoHashQueue, stats: StatsCollector, registry: RemoteNodeRegistry, batch_interval: float = 0.2):
+    """Poll alerts from all nodes, push discovered infohashes, collect remote endpoints."""
     while True:
         for n in nodes:
             for alert in n.pop_alerts():
-                # Check for DHT notification alerts
-                if lt and alert.category() & lt.alert.category_t.dht_notification:
-                    # Extract info_hash from various DHT alerts
-                    info_hash = None
-                    alert_type = alert.what().lower()
-                    
-                    # 1. dht_announce_alert - someone announcing they have the torrent
-                    if hasattr(alert, 'info_hash') and 'announce' in alert_type:
-                        info_hash = alert.info_hash
-                    
-                    # 2. dht_get_peers_alert - someone searching for peers (querying this infohash)
-                    elif hasattr(alert, 'info_hash') and 'get_peers' in alert_type:
-                        info_hash = alert.info_hash
-                    
-                    # 3. dht_sample_infohashes_alert - BEP 51 sample response
-                    elif 'sample' in alert_type and hasattr(alert, 'samples'):
-                        # Process multiple infohashes from sample
+                if not (lt and hasattr(alert, 'category')):
+                    continue
+                alert_type = alert.what().lower()
+
+                # Collect remote endpoints from packet-level alerts (dht_pkt_alert) if available
+                if 'dht_pkt' in alert_type:
+                    # Some builds expose .node (udp endpoint) or .endpoint
+                    ep = None
+                    if hasattr(alert, 'node'):
+                        ep_obj = getattr(alert, 'node')
                         try:
-                            for sample in alert.samples():
-                                sample_ih_bytes = bytes(sample)
-                                sample_ih_hex = sample_ih_bytes.hex()
-                                stats.record_announce(n.index)
-                                await info_queue.add(sample_ih_hex)
+                            ep = (ep_obj.address, ep_obj.port)
                         except Exception:
                             pass
-                        continue  # Already processed, skip single infohash logic
-                    
-                    # 4. Generic info_hash attribute check
+                    elif hasattr(alert, 'endpoint'):
+                        ep_obj = getattr(alert, 'endpoint')
+                        try:
+                            ep = (ep_obj.address, ep_obj.port)
+                        except Exception:
+                            pass
+                    if ep:
+                        await registry.add_or_update(ep)
+                    continue  # pkt alerts generally not carrying infohash
+
+                if alert.category() & lt.alert.category_t.dht_notification:
+                    info_hash = None
+
+                    # Announce & get_peers discovery
+                    if hasattr(alert, 'info_hash') and ('announce' in alert_type or 'get_peers' in alert_type):
+                        info_hash = alert.info_hash
+
+                    # Sample infohashes response
+                    elif alert_type == 'dht_sample_infohashes_alert' and hasattr(alert, 'samples'):
+                        # Update scheduling for this remote node
+                        if hasattr(alert, 'endpoint') and hasattr(alert, 'interval'):
+                            try:
+                                ep_obj = alert.endpoint
+                                ep = (ep_obj.address, ep_obj.port)
+                                interval_secs = int(getattr(alert, 'interval').total_seconds()) if hasattr(alert.interval, 'total_seconds') else 60
+                                await registry.add_or_update(ep)
+                                await registry.schedule_from_sample_alert(ep, interval_secs)
+                            except Exception:
+                                pass
+                        try:
+                            for sample in alert.samples():
+                                sample_hex = bytes(sample).hex()
+                                stats.record_announce(n.index)
+                                await info_queue.add(sample_hex)
+                        except Exception:
+                            pass
+                        continue
+
                     elif hasattr(alert, 'info_hash'):
                         info_hash = alert.info_hash
-                    
+
                     if info_hash:
-                        ih_bytes = bytes(info_hash)
-                        ih_hex = ih_bytes.hex()
+                        ih_hex = bytes(info_hash).hex()
                         stats.record_announce(n.index)
                         await info_queue.add(ih_hex)
+        await registry.prune()
         await asyncio.sleep(batch_interval)
 
 
-async def dht_sample_requester(nodes: List[DHTNode], interval: int, stop_event: asyncio.Event):
-    """Periodically request DHT samples from all nodes (BEP 51)."""
-    # Wait for DHT to bootstrap first
-    await asyncio.sleep(30)
-    
+async def dht_sample_requester(nodes: List[DHTNode], registry: RemoteNodeRegistry, interval: int, stop_event: asyncio.Event):
+    """Periodically send sample_infohashes requests to discovered remote nodes.
+
+    interval: fallback interval if registry empty
+    """
+    await asyncio.sleep(30)  # bootstrap grace period
+    target_node = nodes[0]  # use first local session for outbound sample queries
     while not stop_event.is_set():
-        for node in nodes:
-            node.request_dht_sample()
-        await asyncio.sleep(interval)
+        due_eps = await registry.get_due_endpoints()
+        if not due_eps:
+            # No endpoints yet – retry after fallback interval
+            await asyncio.sleep(interval)
+            continue
+        for ep in due_eps:
+            target_node.request_dht_sample(ep)
+            await registry.mark_requested(ep)
+        # Short sleep to avoid tight loop; actual pacing controlled by per-node next_request
+        await asyncio.sleep(1.0)
 
 
 async def download_worker(name: str, queue: InfoHashQueue, downloader: Downloader):
@@ -390,13 +484,14 @@ async def main(args):
 
     # Workers
     workers = [asyncio.create_task(download_worker(f"worker-{i}", info_queue, downloader)) for i in range(args.download_concurrency)]
-    collector_task = asyncio.create_task(node_alert_collector(nodes, info_queue, stats))
+    registry = RemoteNodeRegistry()
+    collector_task = asyncio.create_task(node_alert_collector(nodes, info_queue, stats, registry))
 
     stop_event = asyncio.Event()
 
     stats_task = asyncio.create_task(periodic_stats(args, info_queue, downloader, stats, args.stats_interval, args.top_sessions, stop_event))
     flush_task = asyncio.create_task(periodic_bloom_flush(bloom, args.bloom_file, args.flush_interval, stop_event))
-    sampler_task = asyncio.create_task(dht_sample_requester(nodes, args.sample_interval, stop_event))
+    sampler_task = asyncio.create_task(dht_sample_requester(nodes, registry, args.sample_interval, stop_event))
 
     loop = asyncio.get_running_loop()
     def request_shutdown():
