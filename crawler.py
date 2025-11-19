@@ -30,23 +30,25 @@ class DHTNode:
     def start(self):
         if lt is None:
             raise RuntimeError("libtorrent not installed. Please pip install libtorrent.")
-        settings = lt.session_params()
-        # Basic tuning: reduce disk usage per session
-        settings.settings.stop_tracker_timeout = 2
-        settings.settings.active_downloads = 3
-        settings.settings.active_seeds = 1
-        settings.settings.active_limit = 10
-        settings.settings.alert_mask = (lt.alert.category_t.dht_notification |
-                                        lt.alert.category_t.status_notification |
-                                        lt.alert.category_t.error_notification)
+        # libtorrent 2.x uses dict-based settings
+        settings = {
+            'listen_interfaces': f'0.0.0.0:{self.port}',
+            'enable_dht': True,
+            'enable_lsd': False,
+            'enable_upnp': False,
+            'enable_natpmp': False,
+            'alert_mask': lt.alert.category_t.dht_notification |
+                         lt.alert.category_t.status_notification |
+                         lt.alert.category_t.error_notification,
+            'active_downloads': 3,
+            'active_seeds': 1,
+            'active_limit': 10,
+        }
         self.session = lt.session(settings)
-        # Bind listen socket
-        self.session.listen_on(self.port, self.port)
-        # Enable DHT
+        # Add DHT bootstrap nodes
         self.session.add_dht_router(("router.bittorrent.com", 6881))
         self.session.add_dht_router(("router.utorrent.com", 6881))
         self.session.add_dht_router(("dht.libtorrent.org", 25401))
-        self.session.start_dht()
         self.started = True
 
     def pop_alerts(self):
