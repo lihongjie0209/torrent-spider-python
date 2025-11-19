@@ -1,0 +1,6 @@
+libtorrent>=2.0.9
+# Optional high-performance event loop (Linux/macOS). On Windows you may skip.
+uvloop>=0.19.0; platform_system != 'Windows'
+click>=8.1.7
+# pybloom_live latest available is 4.0.0; pin to that.
+pybloom_live==4.0.0
