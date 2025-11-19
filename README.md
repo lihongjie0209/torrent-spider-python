@@ -6,7 +6,7 @@
 - **监听 get_peers 查询**：捕获别人正在搜索的 infohash
 - **主动采样（BEP 51）**：周期性向 DHT 节点请求随机 infohash 样本
 - 将 infohash 加入异步下载队列执行下载
-- 下载成功与失败结果统一写入 JSON Lines 文件（`results.jsonl`）
+- 仅保存成功下载结果到 JSON Lines 文件（`results.jsonl`），失败只在控制台打印日志，避免冗余磁盘写入
 - Bloom Filter 去重，避免重复处理相同 infohash
 
 ## 运行环境准备
@@ -63,13 +63,13 @@ python crawler.py --nodes 1000 --listen-start 6880 --download-concurrency 10 --r
 python crawler.py --help
 ```
 
-## 输出 JSONL 格式
-每行一个 JSON 对象：
+## 输出 JSONL 格式（仅成功）
+每行一个成功的下载 JSON 对象：
 ```json
 {
   "infohash": "abcdef0123456789abcdef0123456789abcdef01",
   "timestamp": 1731993600,
-  "status": "success",  // 或 failed
+  "status": "success",
   "name": "Example Torrent",
   "files": [
     {"path": "folder/file.txt", "size": 12345}
@@ -78,14 +78,9 @@ python crawler.py --help
   "failure_reason": null
 }
 ```
-失败时：
-```json
-{
-  "infohash": "...",
-  "timestamp": 1731993600,
-  "status": "failed",
-  "failure_reason": "timeout"
-}
+失败示例（不写入文件，仅控制台输出）：
+```
+[DL-FAIL] abcdef0123456789abcdef0123456789abcdef01 error: metadata_timeout
 ```
 
 ## 功能特性
@@ -99,7 +94,7 @@ python crawler.py --help
 
 ### 去重与统计
 - Bloom Filter 高效去重（支持持久化与自动扩容）
-- 实时统计：全局/节点级别 infohash 速率、下载成功/失败率、重复率
+- 实时统计：全局/节点级别 infohash 速率、下载成功/失败率（失败不落盘）、重复率
 - Top N 节点排名展示
 
 ### 性能优化

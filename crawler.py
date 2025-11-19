@@ -111,7 +111,7 @@ class StatsCollector:
 
 
 class InfoHashQueue:
-    def __init__(self, bloom: Optional[ScalableBloomFilter] = None):
+    def __init__(self, bloom: Optional[Any] = None):
         self._seen: Set[str] = set()  # in-memory quick set for recent items
         self._queue: asyncio.Queue[str] = asyncio.Queue()
         self._bloom = bloom
@@ -167,12 +167,9 @@ class Downloader:
     async def download(self, infohash: str, timeout: int = 300):
         async with self._semaphore:
             if self.max_torrents and len(self._active) >= self.max_torrents:
-                await self.results.write({
-                    "infohash": infohash,
-                    "timestamp": int(time.time()),
-                    "status": "failed",
-                    "failure_reason": "max_torrents_limit"
-                })
+                # Do not persist failures; just log to console per new requirement
+                print(f"[DL-FAIL] {infohash} skipped: max_torrents_limit")
+                self._stats.record_download_result(False)
                 return
             try:
                 self._stats.record_download_start()
@@ -217,12 +214,7 @@ class Downloader:
                         raise TimeoutError("metadata_timeout")
             except Exception as e:
                 self._stats.record_download_result(False)
-                await self.results.write({
-                    "infohash": infohash,
-                    "timestamp": int(time.time()),
-                    "status": "failed",
-                    "failure_reason": str(e)
-                })
+                print(f"[DL-FAIL] {infohash} error: {e}")
             finally:
                 if infohash in self._active:
                     try:
@@ -291,7 +283,7 @@ class RemoteNodeRegistry:
                 del self._nodes[ep]
 
 
-async def node_alert_collector(nodes: List[DHTNode], info_queue: InfoHashQueue, stats: StatsCollector, registry: RemoteNodeRegistry, batch_interval: float = 0.2):
+async def node_alert_collector(nodes: List[DHTNode], info_queue: InfoHashQueue, stats: StatsCollector, registry: RemoteNodeRegistry, batch_interval: float = 0.2, expand_random_per: int = 0):
     """Poll alerts from all nodes, push discovered infohashes, collect remote endpoints."""
     while True:
         for n in nodes:
@@ -326,6 +318,16 @@ async def node_alert_collector(nodes: List[DHTNode], info_queue: InfoHashQueue, 
                     # Announce & get_peers discovery
                     if hasattr(alert, 'info_hash') and ('announce' in alert_type or 'get_peers' in alert_type):
                         info_hash = alert.info_hash
+                        # Seed registry with announcer's endpoint to bootstrap BEP51
+                        if 'announce' in alert_type:
+                            try:
+                                if hasattr(alert, 'ip') and hasattr(alert, 'port'):
+                                    ip = str(getattr(alert, 'ip'))
+                                    port = int(getattr(alert, 'port'))
+                                    if ip and port > 0:
+                                        await registry.add_or_update((ip, port))
+                            except Exception:
+                                pass
 
                     # Sample infohashes response
                     elif alert_type == 'dht_sample_infohashes_alert' and hasattr(alert, 'samples'):
@@ -351,10 +353,15 @@ async def node_alert_collector(nodes: List[DHTNode], info_queue: InfoHashQueue, 
                     elif hasattr(alert, 'info_hash'):
                         info_hash = alert.info_hash
 
-                    if info_hash:
-                        ih_hex = bytes(info_hash).hex()
-                        stats.record_announce(n.index)
-                        await info_queue.add(ih_hex)
+                        if info_hash:
+                            ih_hex = bytes(info_hash).hex()
+                            stats.record_announce(n.index)
+                            await info_queue.add(ih_hex)
+                            # Random expansion: generate synthetic infohashes to probe network / fill queue
+                            if expand_random_per > 0:
+                                for _ in range(expand_random_per):
+                                    synthetic = os.urandom(20).hex()
+                                    await info_queue.add(synthetic)
         await registry.prune()
         await asyncio.sleep(batch_interval)
 
@@ -429,7 +436,7 @@ async def periodic_stats(args, info_queue: InfoHashQueue, downloader: Downloader
         prev_unique = unique_total
 
 
-async def periodic_bloom_flush(bloom: Optional[ScalableBloomFilter], path: Optional[str], interval: int, stop_event: asyncio.Event):
+async def periodic_bloom_flush(bloom: Optional[Any], path: Optional[str], interval: int, stop_event: asyncio.Event):
     if not bloom or not path:
         return
     while not stop_event.is_set():
@@ -440,6 +447,20 @@ async def periodic_bloom_flush(bloom: Optional[ScalableBloomFilter], path: Optio
             print(f"[FLUSH] bloom saved -> {path}")
         except Exception as e:
             print(f"[FLUSH][ERROR] {e}")
+
+
+async def periodic_queue_refill(queue: InfoHashQueue, interval: int, batch_size: int, stop_event: asyncio.Event):
+    """Refill queue with random synthetic infohashes if it becomes empty.
+
+    This helps keep download workers active during early cold start or sparse network periods.
+    """
+    while not stop_event.is_set():
+        await asyncio.sleep(interval)
+        if queue.size() == 0:
+            for _ in range(batch_size):
+                synthetic = os.urandom(20).hex()
+                await queue.add(synthetic)
+            print(f"[REFILL] Added {batch_size} synthetic infohashes (queue was empty)")
 
 
 async def main(args):
@@ -485,13 +506,21 @@ async def main(args):
     # Workers
     workers = [asyncio.create_task(download_worker(f"worker-{i}", info_queue, downloader)) for i in range(args.download_concurrency)]
     registry = RemoteNodeRegistry()
-    collector_task = asyncio.create_task(node_alert_collector(nodes, info_queue, stats, registry))
+    collector_task = asyncio.create_task(node_alert_collector(nodes, info_queue, stats, registry, expand_random_per=args.expand_random_per))
 
     stop_event = asyncio.Event()
 
     stats_task = asyncio.create_task(periodic_stats(args, info_queue, downloader, stats, args.stats_interval, args.top_sessions, stop_event))
     flush_task = asyncio.create_task(periodic_bloom_flush(bloom, args.bloom_file, args.flush_interval, stop_event))
     sampler_task = asyncio.create_task(dht_sample_requester(nodes, registry, args.sample_interval, stop_event))
+
+    # Initial random seeding
+    for _ in range(args.initial_random):
+        seed_ih = os.urandom(20).hex()
+        await info_queue.add(seed_ih)
+
+    # Periodic queue refill task
+    refill_task = asyncio.create_task(periodic_queue_refill(info_queue, args.refill_interval, args.refill_batch, stop_event))
 
     loop = asyncio.get_running_loop()
     def request_shutdown():
@@ -511,6 +540,7 @@ async def main(args):
         stats_task.cancel()
         flush_task.cancel()
         sampler_task.cancel()
+        refill_task.cancel()
         for w in workers:
             w.cancel()
         # Final bloom flush
@@ -536,14 +566,20 @@ async def main(args):
 @click.option('--flush-interval', type=int, default=120, show_default=True, help='Seconds between bloom periodic flush')
 @click.option('--top-sessions', type=int, default=10, show_default=True, help='Top N sessions to display in stats')
 @click.option('--sample-interval', type=int, default=60, show_default=True, help='Seconds between DHT sample requests (BEP 51)')
-def cli(nodes, listen_start, download_concurrency, results, max_torrents, stats_interval, bloom_file, bloom_capacity, bloom_error_rate, flush_interval, top_sessions, sample_interval):
+@click.option('--initial-random', type=int, default=10, show_default=True, help='Initial random synthetic infohash seeds to enqueue at startup')
+@click.option('--expand-random-per', type=int, default=2, show_default=True, help='For each discovered infohash, generate this many random synthetic ones')
+@click.option('--refill-interval', type=int, default=300, show_default=True, help='Seconds between checking for empty queue to refill')
+@click.option('--refill-batch', type=int, default=50, show_default=True, help='Synthetic batch size when refilling empty queue')
+def cli(nodes, listen_start, download_concurrency, results, max_torrents, stats_interval, bloom_file, bloom_capacity, bloom_error_rate, flush_interval, top_sessions, sample_interval, initial_random, expand_random_per, refill_interval, refill_batch):
     args = SimpleNamespace(nodes=nodes, listen_start=listen_start,
                            download_concurrency=download_concurrency,
                            results=results, max_torrents=max_torrents,
                            stats_interval=stats_interval, bloom_file=bloom_file,
                            bloom_capacity=bloom_capacity, bloom_error_rate=bloom_error_rate,
                            flush_interval=flush_interval, top_sessions=top_sessions,
-                           sample_interval=sample_interval)
+                           sample_interval=sample_interval, initial_random=initial_random,
+                           expand_random_per=expand_random_per, refill_interval=refill_interval,
+                           refill_batch=refill_batch)
     try:
         asyncio.run(main(args))
     except RuntimeError as e:
