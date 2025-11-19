@@ -173,35 +173,19 @@ class Downloader:
                 return
             try:
                 self._stats.record_download_start()
-                # Basic validation: only process 40-char hex (SHA1). Skip synthetic malformed.
+                # Basic validation: only process 40-char hex (SHA1). Skip malformed.
                 if len(infohash) != 40:
                     raise ValueError("invalid_length_not_sha1_hex")
                 try:
-                    raw = bytes.fromhex(infohash)
+                    _ = bytes.fromhex(infohash)  # validate hex
                 except ValueError:
                     raise ValueError("invalid_hex_string")
-                # In libtorrent 2.x, use dict-based add_torrent_params
-                # info_hashes expects sha1_hash object, not string
-                handle = None
-                add_err: Optional[Exception] = None
-                try:
-                    params_primary = {
-                        'info_hashes': lt.info_hash_t(lt.sha1_hash(raw)),
-                        'save_path': '/tmp/torrents',  # temp path, we only want metadata
-                    }
-                    handle = self.session.add_torrent(params_primary)
-                except Exception as e_primary:
-                    add_err = e_primary
-                    # Fallback: use magnet URL form (simpler, avoids info_hash_t construction issues on some builds)
-                    try:
-                        params_fallback = {
-                            'url': f"magnet:?xt=urn:btih:{infohash}",
-                            'save_path': '/tmp/torrents',
-                        }
-                        handle = self.session.add_torrent(params_fallback)
-                        print(f"[DL-FALLBACK] used magnet URL for {infohash} due to primary error: {e_primary}")
-                    except Exception as e_fallback:
-                        raise RuntimeError(f"add_torrent_failed primary={e_primary} fallback={e_fallback}")
+                # Magnet-only approach to avoid info_hash_t len() related errors in some builds.
+                params = {
+                    'url': f"magnet:?xt=urn:btih:{infohash}",
+                    'save_path': '/tmp/torrents',  # temp path, we only want metadata
+                }
+                handle = self.session.add_torrent(params)
                 self._active[infohash] = handle
                 start_time = time.time()
                 while True:
