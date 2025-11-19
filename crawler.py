@@ -45,10 +45,10 @@ class DHTNode:
             'active_limit': 10,
         }
         self.session = lt.session(settings)
-        # Add DHT bootstrap nodes
-        self.session.add_dht_router(("router.bittorrent.com", 6881))
-        self.session.add_dht_router(("router.utorrent.com", 6881))
-        self.session.add_dht_router(("dht.libtorrent.org", 25401))
+        # Add DHT bootstrap nodes (host and port as separate arguments)
+        self.session.add_dht_router("router.bittorrent.com", 6881)
+        self.session.add_dht_router("router.utorrent.com", 6881)
+        self.session.add_dht_router("dht.libtorrent.org", 25401)
         self.started = True
 
     def pop_alerts(self):
