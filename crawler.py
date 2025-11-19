@@ -61,6 +61,20 @@ class DHTNode:
         if not self.started:
             return []
         return self.session.pop_alerts()
+    
+    def request_dht_sample(self):
+        """Request DHT sample_infohashes (BEP 51) if supported."""
+        if not self.started:
+            return
+        try:
+            # session.dht_sample_infohashes(endpoint, target) - BEP 51
+            if hasattr(self.session, 'dht_sample_infohashes'):
+                # Use localhost endpoint and random 20-byte target
+                ep = ('127.0.0.1', self.port)
+                target = lt.sha1_hash(os.urandom(20))
+                self.session.dht_sample_infohashes(ep, target)
+        except Exception:
+            pass  # Silently ignore if not supported or endpoint format wrong
 
 
 class StatsCollector:
@@ -225,16 +239,30 @@ async def node_alert_collector(nodes: List[DHTNode], info_queue: InfoHashQueue, 
                 if lt and alert.category() & lt.alert.category_t.dht_notification:
                     # Extract info_hash from various DHT alerts
                     info_hash = None
+                    alert_type = alert.what().lower()
                     
                     # 1. dht_announce_alert - someone announcing they have the torrent
-                    if hasattr(alert, 'info_hash') and 'announce' in alert.what().lower():
+                    if hasattr(alert, 'info_hash') and 'announce' in alert_type:
                         info_hash = alert.info_hash
                     
                     # 2. dht_get_peers_alert - someone searching for peers (querying this infohash)
-                    elif hasattr(alert, 'info_hash') and 'get_peers' in alert.what().lower():
+                    elif hasattr(alert, 'info_hash') and 'get_peers' in alert_type:
                         info_hash = alert.info_hash
                     
-                    # 3. Generic info_hash attribute check
+                    # 3. dht_sample_infohashes_alert - BEP 51 sample response
+                    elif 'sample' in alert_type and hasattr(alert, 'samples'):
+                        # Process multiple infohashes from sample
+                        try:
+                            for sample in alert.samples():
+                                sample_ih_bytes = bytes(sample)
+                                sample_ih_hex = sample_ih_bytes.hex()
+                                stats.record_announce(n.index)
+                                await info_queue.add(sample_ih_hex)
+                        except Exception:
+                            pass
+                        continue  # Already processed, skip single infohash logic
+                    
+                    # 4. Generic info_hash attribute check
                     elif hasattr(alert, 'info_hash'):
                         info_hash = alert.info_hash
                     
@@ -244,6 +272,17 @@ async def node_alert_collector(nodes: List[DHTNode], info_queue: InfoHashQueue, 
                         stats.record_announce(n.index)
                         await info_queue.add(ih_hex)
         await asyncio.sleep(batch_interval)
+
+
+async def dht_sample_requester(nodes: List[DHTNode], interval: int, stop_event: asyncio.Event):
+    """Periodically request DHT samples from all nodes (BEP 51)."""
+    # Wait for DHT to bootstrap first
+    await asyncio.sleep(30)
+    
+    while not stop_event.is_set():
+        for node in nodes:
+            node.request_dht_sample()
+        await asyncio.sleep(interval)
 
 
 async def download_worker(name: str, queue: InfoHashQueue, downloader: Downloader):
@@ -357,6 +396,7 @@ async def main(args):
 
     stats_task = asyncio.create_task(periodic_stats(args, info_queue, downloader, stats, args.stats_interval, args.top_sessions, stop_event))
     flush_task = asyncio.create_task(periodic_bloom_flush(bloom, args.bloom_file, args.flush_interval, stop_event))
+    sampler_task = asyncio.create_task(dht_sample_requester(nodes, args.sample_interval, stop_event))
 
     loop = asyncio.get_running_loop()
     def request_shutdown():
@@ -375,6 +415,7 @@ async def main(args):
         collector_task.cancel()
         stats_task.cancel()
         flush_task.cancel()
+        sampler_task.cancel()
         for w in workers:
             w.cancel()
         # Final bloom flush
@@ -399,13 +440,15 @@ async def main(args):
 @click.option('--bloom-error-rate', type=float, default=0.001, show_default=True, help='Bloom filter error rate')
 @click.option('--flush-interval', type=int, default=120, show_default=True, help='Seconds between bloom periodic flush')
 @click.option('--top-sessions', type=int, default=10, show_default=True, help='Top N sessions to display in stats')
-def cli(nodes, listen_start, download_concurrency, results, max_torrents, stats_interval, bloom_file, bloom_capacity, bloom_error_rate, flush_interval, top_sessions):
+@click.option('--sample-interval', type=int, default=60, show_default=True, help='Seconds between DHT sample requests (BEP 51)')
+def cli(nodes, listen_start, download_concurrency, results, max_torrents, stats_interval, bloom_file, bloom_capacity, bloom_error_rate, flush_interval, top_sessions, sample_interval):
     args = SimpleNamespace(nodes=nodes, listen_start=listen_start,
                            download_concurrency=download_concurrency,
                            results=results, max_torrents=max_torrents,
                            stats_interval=stats_interval, bloom_file=bloom_file,
                            bloom_capacity=bloom_capacity, bloom_error_rate=bloom_error_rate,
-                           flush_interval=flush_interval, top_sessions=top_sessions)
+                           flush_interval=flush_interval, top_sessions=top_sessions,
+                           sample_interval=sample_interval)
     try:
         asyncio.run(main(args))
     except RuntimeError as e:
