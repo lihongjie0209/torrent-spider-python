@@ -155,9 +155,11 @@ class Downloader:
             try:
                 self._stats.record_download_start()
                 ih = lt.sha1_hash(bytes.fromhex(infohash))
-                params = lt.add_torrent_params()
-                params.info_hash = ih
-                params.flags |= lt.add_torrent_params_flags.flag_seed_mode  # start minimal
+                # In libtorrent 2.x, use dict-based add_torrent_params
+                params = {
+                    'info_hash': ih,
+                    'save_path': '/tmp/torrents',  # temp path, we only want metadata
+                }
                 handle = self.session.add_torrent(params)
                 self._active[infohash] = handle
                 start_time = time.time()
