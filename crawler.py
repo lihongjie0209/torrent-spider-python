@@ -154,10 +154,10 @@ class Downloader:
                 return
             try:
                 self._stats.record_download_start()
-                ih = lt.sha1_hash(bytes.fromhex(infohash))
                 # In libtorrent 2.x, use dict-based add_torrent_params
+                # info_hashes expects sha1_hash object, not string
                 params = {
-                    'info_hash': ih,
+                    'info_hashes': lt.info_hash_t(lt.sha1_hash(bytes.fromhex(infohash))),
                     'save_path': '/tmp/torrents',  # temp path, we only want metadata
                 }
                 handle = self.session.add_torrent(params)
