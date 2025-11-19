@@ -221,11 +221,25 @@ async def node_alert_collector(nodes: List[DHTNode], info_queue: InfoHashQueue, 
     while True:
         for n in nodes:
             for alert in n.pop_alerts():
-                # Check for DHT announce alerts
+                # Check for DHT notification alerts
                 if lt and alert.category() & lt.alert.category_t.dht_notification:
-                    # Extract info_hash from dht_announce_alert
-                    if hasattr(alert, 'info_hash'):
-                        ih_bytes = bytes(alert.info_hash)
+                    # Extract info_hash from various DHT alerts
+                    info_hash = None
+                    
+                    # 1. dht_announce_alert - someone announcing they have the torrent
+                    if hasattr(alert, 'info_hash') and 'announce' in alert.what().lower():
+                        info_hash = alert.info_hash
+                    
+                    # 2. dht_get_peers_alert - someone searching for peers (querying this infohash)
+                    elif hasattr(alert, 'info_hash') and 'get_peers' in alert.what().lower():
+                        info_hash = alert.info_hash
+                    
+                    # 3. Generic info_hash attribute check
+                    elif hasattr(alert, 'info_hash'):
+                        info_hash = alert.info_hash
+                    
+                    if info_hash:
+                        ih_bytes = bytes(info_hash)
                         ih_hex = ih_bytes.hex()
                         stats.record_announce(n.index)
                         await info_queue.add(ih_hex)
